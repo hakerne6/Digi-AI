@@ -1,0 +1,553 @@
+# =============================================================================
+# SOC / Threat Intelligence Stack — docker-compose.yml
+# =============================================================================
+# Prerequisites:
+#   echo "vm.max_map_count=262144" | sudo tee -a /etc/sysctl.conf && sudo sysctl -p
+#
+# Copy .env.example to .env and fill all values before running.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Redis (shared by OpenCTI and MISP)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis-data:/data
+
+  # ---------------------------------------------------------------------------
+  # RabbitMQ
+  # ---------------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+
+  # ---------------------------------------------------------------------------
+  # Wazuh Manager
+  # FIX: added all required /var/ossec/* sub-volume mounts (official paths),
+  #      correct nofile ulimit, required environment variables, and agent ports.
+  # ---------------------------------------------------------------------------
+  wazuh-manager:
+    image: wazuh/wazuh-manager:4.9.0
+    hostname: wazuh-manager
+    restart: unless-stopped
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 655360
+        hard: 655360
+    ports:
+      - "1514:1514"          # Agent communication (UDP/TCP)
+      - "1515:1515"          # Agent enrollment
+      - "514:514/udp"        # Syslog input
+      - "55000:55000"        # REST API
+    environment:
+      - INDEXER_URL=https://wazuh-indexer:9200
+      - INDEXER_USERNAME=${WAZUH_INDEXER_USERNAME:-admin}
+      - INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD:-SecretPassword}
+      - FILEBEAT_SSL_VERIFICATION_MODE=none   # set to 'full' when using real certs
+      - API_USERNAME=${WAZUH_API_USERNAME:-wazuh-wui}
+      - API_PASSWORD=${WAZUH_API_PASSWORD:-MyS3cr37P450r}
+    volumes:
+      - wazuh-manager-api-configuration:/var/ossec/api/configuration
+      - wazuh-manager-etc:/var/ossec/etc
+      - wazuh-manager-logs:/var/ossec/logs
+      - wazuh-manager-queue:/var/ossec/queue
+      - wazuh-manager-var-multigroups:/var/ossec/var/multigroups
+      - wazuh-manager-integrations:/var/ossec/integrations
+      - wazuh-manager-active-response:/var/ossec/active-response/bin
+      - wazuh-manager-agentless:/var/ossec/agentless
+      - wazuh-manager-wodles:/var/ossec/wodles
+      - wazuh-manager-filebeat-etc:/etc/filebeat
+      - wazuh-manager-filebeat-var:/var/lib/filebeat
+
+  # ---------------------------------------------------------------------------
+  # Wazuh Indexer  (OpenSearch-based)
+  # FIX: correct data path is /var/lib/wazuh-indexer (not opensearch path),
+  #      added environment variables and port exposure.
+  # ---------------------------------------------------------------------------
+  wazuh-indexer:
+    image: wazuh/wazuh-indexer:4.9.0
+    hostname: wazuh-indexer
+    restart: unless-stopped
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"
+    environment:
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+      - INDEXER_USERNAME=${WAZUH_INDEXER_USERNAME:-admin}
+      - INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD:-SecretPassword}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk https://localhost:9200 -u ${WAZUH_INDEXER_USERNAME:-admin}:${WAZUH_INDEXER_PASSWORD:-SecretPassword} | grep -q 'cluster_name'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    volumes:
+      # FIX: correct persistent data path for wazuh-indexer image
+      - wazuh-indexer-data:/var/lib/wazuh-indexer
+      # Optional — mount custom opensearch.yml if you have one:
+      # - ./config/wazuh/indexer/wazuh.indexer.yml:/usr/share/wazuh-indexer/opensearch.yml:ro
+
+  # ---------------------------------------------------------------------------
+  # Wazuh Dashboard  (OpenSearch Dashboards-based)
+  # FIX: correct data path is /usr/share/wazuh-dashboard/data,
+  #      added environment variables, depends_on healthcheck conditions.
+  # ---------------------------------------------------------------------------
+  wazuh-dashboard:
+    image: wazuh/wazuh-dashboard:4.9.0
+    hostname: wazuh-dashboard
+    restart: unless-stopped
+    depends_on:
+      wazuh-indexer:
+        condition: service_healthy
+      wazuh-manager:
+        condition: service_started
+    ports:
+      - "5601:5601"
+    environment:
+      - INDEXER_USERNAME=${WAZUH_INDEXER_USERNAME:-admin}
+      - INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD:-SecretPassword}
+      - WAZUH_API_URL=https://wazuh-manager
+      - API_USERNAME=${WAZUH_API_USERNAME:-wazuh-wui}
+      - API_PASSWORD=${WAZUH_API_PASSWORD:-MyS3cr37P450r}
+    volumes:
+      # FIX: correct dashboard data path (not /usr/share/kibana/data)
+      - wazuh-dashboard-data:/usr/share/wazuh-dashboard/data
+      # Optional — mount custom opensearch_dashboards.yml:
+      # - ./config/wazuh/dashboard/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/opensearch_dashboards.yml:ro
+
+  # ---------------------------------------------------------------------------
+  # Suricata
+  # FIX: added log/run volume for persistent output; cap_add NET_ADMIN is
+  #      typically required for inline/IPS mode and raw packet capture.
+  # ---------------------------------------------------------------------------
+  suricata:
+    image: jasonish/suricata:7.0
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_NICE
+    network_mode: host        # required for full packet visibility; remove if not needed
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - ./config/suricata/suricata.yaml:/etc/suricata/suricata.yaml:ro
+      - suricata-logs:/var/log/suricata
+      - suricata-rules:/etc/suricata/rules
+
+  # ---------------------------------------------------------------------------
+  # OpenCTI Platform
+  # FIX: exposed port 8080, added APP__BASE_URL and S3/MinIO wiring.
+  # ---------------------------------------------------------------------------
+  opencti-platform:
+    image: opencti/platform:6.3.0
+    hostname: opencti-platform
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      - NODE_OPTIONS=--max-old-space-size=8096
+      - APP__PORT=8080
+      - APP__BASE_URL=${OPENCTI_BASE_URL:-http://localhost:8080}
+      - APP__ADMIN__EMAIL=${OPENCTI_ADMIN_EMAIL}
+      - APP__ADMIN__PASSWORD=${OPENCTI_ADMIN_PASSWORD}
+      - APP__ADMIN__TOKEN=${OPENCTI_ADMIN_TOKEN}
+      - APP__APP_LOGS__LOGS_LEVEL=error
+      - REDIS__HOSTNAME=redis
+      - REDIS__PORT=6379
+      - ELASTICSEARCH__URL=http://elasticsearch:9200
+      - MINIO__ENDPOINT=minio
+      - MINIO__PORT=9000
+      - MINIO__USE_SSL=false
+      - MINIO__ACCESS_KEY=${MINIO_ROOT_USER}
+      - MINIO__SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - RABBITMQ__HOSTNAME=rabbitmq
+      - RABBITMQ__PORT=5672
+      - RABBITMQ__USERNAME=${RABBITMQ_DEFAULT_USER:-guest}
+      - RABBITMQ__PASSWORD=${RABBITMQ_DEFAULT_PASS:-guest}
+      - SMTP__HOSTNAME=${SMTP_HOSTNAME:-localhost}
+      - PROVIDERS__LOCAL__STRATEGY=LocalStrategy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+
+  # ---------------------------------------------------------------------------
+  # OpenCTI Worker
+  # FIX: added required OPENCTI_URL and OPENCTI_TOKEN environment variables.
+  # ---------------------------------------------------------------------------
+  opencti-worker:
+    image: opencti/worker:6.3.0
+    restart: unless-stopped
+    depends_on:
+      opencti-platform:
+        condition: service_healthy
+    environment:
+      - OPENCTI_URL=http://opencti-platform:8080
+      - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
+      - WORKER_LOG_LEVEL=error
+    deploy:
+      mode: replicated
+      replicas: 3
+
+  # ---------------------------------------------------------------------------
+  # n8n
+  # ---------------------------------------------------------------------------
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    environment:
+      - N8N_API_KEY=${N8N_API_KEY}
+      - N8N_HOST=0.0.0.0
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=${N8N_WEBHOOK_URL:-http://localhost:5678/}
+    volumes:
+      - n8n-data:/home/node/.n8n
+    ports:
+      - "5678:5678"
+
+  # ---------------------------------------------------------------------------
+  # MISP Core
+  # ---------------------------------------------------------------------------
+  misp-core:
+    image: ghcr.io/misp/misp-docker/misp-core:latest
+    restart: unless-stopped
+    depends_on:
+      misp-db:
+        condition: service_healthy
+      misp-redis:
+        condition: service_healthy
+    environment:
+      - MISP_BASEURL=${MISP_BASEURL:-http://localhost}
+      - MISP_ADMIN_EMAIL=${MISP_ADMIN_EMAIL}
+      - MISP_ADMIN_PW=${MISP_ADMIN_PW}
+      - MYSQL_HOST=misp-db
+      - MYSQL_DATABASE=misp
+      - MYSQL_USER=misp
+      - MYSQL_PASSWORD=${MYSQL_MISP_PASSWORD:-misp}
+      - REDIS_FQDN=misp-redis
+    volumes:
+      - misp-data:/var/www/MISP/app/files
+    ports:
+      - "8888:80"
+
+  misp-db:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=misp
+      - MYSQL_USER=misp
+      - MYSQL_PASSWORD=${MYSQL_MISP_PASSWORD:-misp}
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - misp-mysql-data:/var/lib/mysql
+
+  misp-redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - misp-redis-data:/data
+
+  # ---------------------------------------------------------------------------
+  # Shuffle
+  # FIX: hardcoded DB password moved to env var; added SHUFFLE_APP_HOTLOAD_FOLDER
+  #      and ORG_ID; shuffle-data volume correctly wired.
+  # ---------------------------------------------------------------------------
+  shuffle-backend:
+    image: ghcr.io/shuffle/shuffle-backend:latest
+    restart: unless-stopped
+    depends_on:
+      shuffle-db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgres://shuffle:${SHUFFLE_DB_PASSWORD:-shufflepassword}@shuffle-db:5432/shuffle
+      - BACKEND_HOSTNAME=shuffle-backend
+      - SHUFFLE_APP_HOTLOAD_FOLDER=/shuffle-apps
+      - ORG_ID=default
+    volumes:
+      - shuffle-data:/shuffle-apps
+
+  shuffle-db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=shuffle
+      - POSTGRES_PASSWORD=${SHUFFLE_DB_PASSWORD:-shufflepassword}
+      - POSTGRES_DB=shuffle
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shuffle"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - shuffle-db:/var/lib/postgresql/data
+
+  shuffle-frontend:
+    image: ghcr.io/shuffle/shuffle-frontend:latest
+    restart: unless-stopped
+    depends_on:
+      - shuffle-backend
+    environment:
+      - BACKEND_HOSTNAME=shuffle-backend
+    ports:
+      - "3000:3000"
+
+  # ---------------------------------------------------------------------------
+  # Elasticsearch + Kibana + Logstash + Filebeat
+  # FIX: Kibana data path corrected to /usr/share/kibana/data (already correct);
+  #      added xpack.security.enabled=false for single-node dev, nofile ulimits,
+  #      and healthchecks.
+  # ---------------------------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.0
+    restart: unless-stopped
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "5602:5601"   # mapped to 5602 to avoid conflict with Wazuh Dashboard on 5601
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - xpack.security.enabled=false
+    volumes:
+      - kibana-data:/usr/share/kibana/data
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.13.0
+    restart: unless-stopped
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - "LS_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - logstash-pipeline:/usr/share/logstash/pipeline
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.13.0
+    restart: unless-stopped
+    user: root                          # required to read host logs
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ./config/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  # ---------------------------------------------------------------------------
+  # Nginx  (Reverse Proxy / TLS termination)
+  # FIX: added nginx.conf config mount — without it Nginx serves only the
+  #      default page and cannot proxy to any backend.
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.25-alpine
+    restart: unless-stopped
+    depends_on:
+      - wazuh-dashboard
+      - opencti-platform
+      - n8n
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/nginx/conf.d:/etc/nginx/conf.d:ro
+      - nginx-certs:/etc/ssl/certs
+      - nginx-logs:/var/log/nginx
+
+  # ---------------------------------------------------------------------------
+  # MinIO  (S3-compatible object store — used by OpenCTI)
+  # FIX: added --console-address so the console port is fixed (9001),
+  #      exposed console port separately.
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2024-03-15T01-07-19Z
+    restart: unless-stopped
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"   # MinIO web console
+
+  # ---------------------------------------------------------------------------
+  # OpenSearch  (standalone, separate from Wazuh indexer)
+  # ---------------------------------------------------------------------------
+  opensearch:
+    image: opensearchproject/opensearch:2.5.0
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+      - plugins.security.disabled=true   # disable TLS for dev; remove in production
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q 'cluster_name'"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+
+  # ---------------------------------------------------------------------------
+  # Qdrant  (vector database)
+  # ---------------------------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:v1.9.2
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+# =============================================================================
+# Named Volumes
+# FIX: removed orphaned 'shuffle-data' → now correctly wired to shuffle-backend;
+#      added all wazuh-manager sub-volumes, suricata volumes, misp-data.
+# =============================================================================
+volumes:
+  # Redis
+  redis-data:
+
+  # RabbitMQ
+  rabbitmq-data:
+
+  # Wazuh Manager — all required /var/ossec/* sub-directories
+  wazuh-manager-api-configuration:
+  wazuh-manager-etc:
+  wazuh-manager-logs:
+  wazuh-manager-queue:
+  wazuh-manager-var-multigroups:
+  wazuh-manager-integrations:
+  wazuh-manager-active-response:
+  wazuh-manager-agentless:
+  wazuh-manager-wodles:
+  wazuh-manager-filebeat-etc:
+  wazuh-manager-filebeat-var:
+
+  # Wazuh Indexer — correct path is /var/lib/wazuh-indexer
+  wazuh-indexer-data:
+
+  # Wazuh Dashboard — correct path is /usr/share/wazuh-dashboard/data
+  wazuh-dashboard-data:
+
+  # Suricata
+  suricata-logs:
+  suricata-rules:
+
+  # n8n
+  n8n-data:
+
+  # MISP
+  misp-data:
+  misp-mysql-data:
+  misp-redis-data:
+
+  # Shuffle
+  shuffle-db:
+  shuffle-data:
+
+  # ELK
+  elasticsearch-data:
+  kibana-data:
+  logstash-pipeline:
+
+  # Nginx
+  nginx-logs:
+  nginx-certs:
+
+  # MinIO
+  minio-data:
+
+  # OpenSearch
+  opensearch-data:
+
+  # Qdrant
+  qdrant-data:
